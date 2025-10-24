@@ -1,0 +1,183 @@
+name: Auto Update AI Content
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'    # every 6 hours at minute 0
+  workflow_dispatch:        # allows manual run from Actions tab
+
+jobs:
+  update-content:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Call OpenAI to generate compact JSON content
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "Requesting new content from OpenAI..."
+          # The model is asked to return JSON only with fixed keys.
+          read -r -d '' PROMPT <<'EOF'
+You are a helpful assistant. Produce a JSON object only (no extra text) with these keys:
+- featured_tool: string (one sentence, include tool name and one-line description and a link)
+- top_tools: array of 5 strings (each string: "Name - one-line description - URL")
+- quote: string (short quote and attribution)
+- trending: array of 5 short strings (topics/headlines)
+- productivity: string (one-line tip)
+
+Keep answers short and safe. Return only valid JSON.
+EOF
+
+          response=$(curl -sS https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d @- <<JSON
+{
+  "model": "gpt-3.5-turbo",
+  "messages": [{"role": "system", "content": "You are a concise JSON-generating assistant."},
+               {"role": "user", "content": "$PROMPT"}],
+  "max_tokens": 400,
+  "temperature": 0.6
+}
+JSON
+)
+
+          echo "$response" > openai_raw.json
+          # Extract the assistant content (safe guard)
+          cat openai_raw.json | jq -r '.choices[0].message.content' > openai_content.txt || true
+          echo "---- OpenAI raw output ----"
+          cat openai_content.txt || true
+
+      - name: Validate JSON and parse
+        run: |
+          # Ensure content is JSON. Try to extract JSON substring if extra text exists.
+          CONTENT=$(cat openai_content.txt)
+          # If the content already valid JSON, ok; otherwise attempt to extract {...}
+          if echo "$CONTENT" | jq . >/dev/null 2>&1; then
+            echo "Valid JSON received."
+            echo "$CONTENT" > new_content.json
+          else
+            echo "Attempting to extract JSON substring..."
+            echo "$CONTENT" | sed -n 's/.*\({.*}\).*/\1/p' > new_content.json
+          fi
+          echo "Parsed JSON:"
+          jq . new_content.json
+
+      - name: Build index.html from template + inserted content
+        run: |
+          if [ ! -f new_content.json ]; then
+            echo "No JSON content found — aborting."
+            exit 1
+          fi
+
+          featured=$(jq -r '.featured_tool' new_content.json)
+          quote=$(jq -r '.quote' new_content.json)
+          productivity=$(jq -r '.productivity' new_content.json)
+
+          # Build top tools HTML
+          top_html="<ul>"
+          jq -r '.top_tools[]' new_content.json | while IFS= read -r line; do
+            top_html="${top_html}<li>${line}</li>"
+          done
+          top_html="${top_html}</ul>"
+
+          # Build trending HTML
+          trending_html="<ul>"
+          jq -r '.trending[]' new_content.json | while IFS= read -r line; do
+            trending_html="${trending_html}<li>${line}</li>"
+          done
+          trending_html="${trending_html}</ul>"
+
+          # Create index.html (keeps style.css)
+          cat > index.html <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Free AI Tools Today - discover daily free AI websites, motivation, and productivity hacks." />
+  <title>Free AI Tools Today</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Free AI Tools Today</h1>
+    <p>Your daily dose of free AI power, motivation, and productivity.</p>
+  </header>
+
+  <div class="ad-box">[AdSense Ad Here]</div>
+
+  <section id="featured-tool">
+    <h2>🔥 Featured AI Tool of the Day</h2>
+    PLACEHOLDER_FEATURED
+  </section>
+
+  <section id="top-tools">
+    <h2>🧰 Top 5 Free AI Tools</h2>
+    PLACEHOLDER_TOP
+  </section>
+
+  <div class="ad-box">[AdSense Ad Here]</div>
+
+  <section id="motivation">
+    <h2>🌞 Daily Motivation Quote</h2>
+    PLACEHOLDER_QUOTE
+  </section>
+
+  <section id="trending">
+    <h2>🌍 Trending Topics</h2>
+    PLACEHOLDER_TREND
+  </section>
+
+  <section id="productivity">
+    <h2>⚡ AI Productivity Hack</h2>
+    PLACEHOLDER_PRODUCT
+  </section>
+
+  <section id="about">
+    <h2>ℹ️ About This Website</h2>
+    <p><strong>FreeAIToolsToday.com</strong> shares new AI tools, productivity ideas, and inspiration daily. Our goal is to make AI easy and free for everyone.</p>
+  </section>
+
+  <div class="ad-box">[AdSense Ad Here]</div>
+
+  <footer>
+    <p>© 2025 FreeAIToolsToday.com | All rights reserved</p>
+  </footer>
+</body>
+</html>
+HTML
+
+          # Replace placeholders with the generated content (escaped)
+          sed -i "s|PLACEHOLDER_FEATURED|<p>${featured}</p>|g" index.html
+          # Insert top tools HTML
+          top_html_escaped=$(printf '%s\n' "$top_html" | sed 's|/|\\/|g')
+          sed -i "s|PLACEHOLDER_TOP|${top_html_escaped}|g" index.html
+          # Quote
+          sed -i "s|PLACEHOLDER_QUOTE|<blockquote>${quote}</blockquote>|g" index.html
+          # Trending
+          trending_html_escaped=$(printf '%s\n' "$trending_html" | sed 's|/|\\/|g')
+          sed -i "s|PLACEHOLDER_TREND|${trending_html_escaped}|g" index.html
+          # Productivity
+          sed -i "s|PLACEHOLDER_PRODUCT|<p>${productivity}</p>|g" index.html
+
+          echo "New index.html created:"
+          head -n 60 index.html
+
+      - name: Commit and push updated index.html
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add index.html
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto update content: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            git push
+          fi
